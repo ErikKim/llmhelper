@@ -1,0 +1,14 @@
+# Build output (signed with the builder's own identity — never commit)
+build/
+
+# Local code-signing material (private keys, certs)
+signing/
+*.p12
+*.pem
+*.cer
+
+# Local user config (lives in ~/.config/llmhelper, but ignore if copied here)
+config.json
+
+# macOS
+.DS_Store
