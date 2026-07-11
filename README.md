@@ -2,15 +2,16 @@
 
 **English** · [한국어](README.ko.md)
 
-A tiny macOS menu-bar helper that runs your selected text through a **local [Ollama](https://ollama.com) model** — translate, explain simply, or explain in detail — and streams the result into a small floating window you can copy from. Everything is a direct call to `localhost:11434`: no internet, no CORS, no API keys.
+A tiny macOS menu-bar helper that runs your selected text through a **local [Ollama](https://ollama.com) model** — translate, explain simply, explain in detail, or summarize — and streams the result into a small floating window you can copy from. Everything is a direct call to `localhost:11434`: no internet, no CORS, no API keys.
 
 ## Features
 
-- **Global hotkeys** — select text anywhere, then `⌃⌥1` (translate) · `⌃⌥2` (explain simply) · `⌃⌥3` (in detail). The current selection is grabbed automatically.
+- **Global hotkeys** — select text anywhere, then `⌃⌥1` (translate) · `⌃⌥2` (explain simply) · `⌃⌥3` (in detail) · `⌃⌥4` (summarize). The current selection is grabbed automatically.
 - **Menu-bar fallback** — copy text (`⌘C`), then click the ✨ menu-bar icon → a mode. No special permission needed.
 - **Streaming floating panel** — appears near the cursor, types the answer in live, has a **Copy** button (and `⌘C`), and **auto-closes when it loses focus**.
 - **Model picker** — the ✨ menu lists your installed Ollama models (embedding models filtered out); pick one and it applies instantly.
-- **Settings window** — edit the Ollama host, model, and the three prompts (the `{text}` placeholder is replaced by your selection). Reset to defaults anytime.
+- **Settings window** — edit the Ollama host, model, and the four prompts (the `{text}` placeholder is replaced by your selection). Reset to defaults anytime.
+- **GMK keycap lookup** — select a set name (e.g. `GMK Botanical`) and hit `⌃⌥5` to see its base kit / novelties / child-kit renders in a floating panel, pulled from the community catalog at [matrixzj.github.io](https://matrixzj.github.io/docs/gmk-keycaps). No API key, no LLM involved.
 
 ## Requirements
 
@@ -49,6 +50,8 @@ If you'd rather not grant it, use the menu-bar path (`⌘C` then click ✨), whi
 | Translate (KO↔EN) | `⌃⌥1` | ✨ → 번역 |
 | Explain simply | `⌃⌥2` | ✨ → 쉽게 설명 |
 | Explain in detail | `⌃⌥3` | ✨ → 상세히 |
+| Summarize | `⌃⌥4` | ✨ → 요약 |
+| GMK keycap lookup | `⌃⌥5` | ✨ → GMK 검색 |
 
 ## Settings
 

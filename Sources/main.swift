@@ -14,6 +14,7 @@ struct Config {
         "translate": "다음 텍스트를 번역해줘. 입력이 한국어면 자연스러운 영어로, 그 외 언어면 자연스러운 한국어로. 부연 설명 없이 번역문만 출력해.\n\n{text}",
         "explain":   "다음 내용을 핵심만 골라 아주 짧고 간결하게 한국어로 설명해줘. 2~3문장 이내로. 서론·군더더기·불필요한 예시 없이 바로 핵심만.\n\n{text}",
         "detail":    "다음 내용을 배경·핵심·함의까지 자세하고 정확하게 한국어로 설명해줘. 필요하면 항목으로 정리해도 좋아.\n\n{text}",
+        "summarize": "다음 텍스트를 한국어로 요약해줘. 핵심 내용을 빠뜨리지 말고, 원문 길이에 따라 3~5개의 항목 또는 짧은 문단으로. 부연 설명 없이 요약만 출력해.\n\n{text}",
     ]
 
     func prompt(for mode: Mode, text: String) -> String {
@@ -51,14 +52,333 @@ struct Config {
 // MARK: - Modes
 
 enum Mode: String {
-    case translate, explain, detail
+    case translate, explain, detail, summarize
 
     var title: String {
         switch self {
         case .translate: return "번역"
         case .explain:   return "쉽게 설명"
         case .detail:    return "상세히"
+        case .summarize: return "요약"
         }
+    }
+}
+
+// MARK: - GMK Catalog (matrixzj.github.io)
+
+enum GMK {
+    struct Kit { let name: String; let url: URL }
+    struct SetInfo { let name: String; let page: URL; let kits: [Kit] }
+    enum LookupError: Error {
+        case network(String)
+        case notFound(suggestions: [String])
+    }
+
+    static let site = "https://matrixzj.github.io"
+    private static var slugCache: [String] = []
+
+    // "GMK Alt-Alphas!" → "altalphas" : 비교용 정규화
+    static func norm(_ s: String) -> String {
+        let lowered = s.lowercased().replacingOccurrences(of: "gmk", with: "")
+        return String(String.UnicodeScalarView(lowered.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }))
+    }
+
+    private static func fetchHTML(_ url: URL) async throws -> String {
+        let (data, resp) = try await URLSession.shared.data(from: url)
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let html = String(data: data, encoding: .utf8) else {
+            throw LookupError.network("카탈로그 응답 오류 (matrixzj.github.io)")
+        }
+        return html
+    }
+
+    private static func matches(_ pattern: String, in text: String) -> [[String]] {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else { return [] }
+        return re.matches(in: text, range: NSRange(text.startIndex..., in: text)).map { m in
+            (0..<m.numberOfRanges).map { i in
+                Range(m.range(at: i), in: text).map { String(text[$0]) } ?? ""
+            }
+        }
+    }
+
+    // 전체 세트 slug 목록 (모든 페이지의 nav 에 다 들어있어 인덱스 한 장이면 충분. 앱 실행 중 캐시)
+    static func slugs() async throws -> [String] {
+        if !slugCache.isEmpty { return slugCache }
+        let html = try await fetchHTML(URL(string: site + "/docs/gmk-keycaps")!)
+        var seen = Set<String>(), out: [String] = []
+        for m in matches("docs/gmk-keycaps/([^/\"#]+)/", in: html) {
+            let slug = m[1]
+            if slug != "ColorCodes", seen.insert(slug).inserted { out.append(slug) }
+        }
+        guard !out.isEmpty else { throw LookupError.network("세트 목록을 파싱하지 못했어요") }
+        slugCache = out
+        return out
+    }
+
+    static func search(_ query: String) async throws -> SetInfo {
+        let q = norm(query)
+        guard !q.isEmpty else { throw LookupError.notFound(suggestions: []) }
+        var best: (slug: String, score: Int, len: Int)?
+        var similar: [String] = []
+        for slug in try await slugs() {
+            let display = (slug.removingPercentEncoding ?? slug).replacingOccurrences(of: "-", with: " ")
+            let n = norm(display)
+            guard !n.isEmpty else { continue }
+            let score: Int
+            if n == q { score = 3 }
+            else if n.hasPrefix(q) || q.hasPrefix(n) { score = 2 }
+            else if n.contains(q) || q.contains(n) { score = 1 }
+            else { continue }
+            similar.append(display)
+            if best == nil || score > best!.score || (score == best!.score && n.count < best!.len) {
+                best = (slug, score, n.count)
+            }
+        }
+        guard let hit = best else { throw LookupError.notFound(suggestions: Array(similar.prefix(5))) }
+        return try await fetchSet(slug: hit.slug)
+    }
+
+    static func fetchSet(slug: String) async throws -> SetInfo {
+        let page = URL(string: site + "/docs/gmk-keycaps/" + slug + "/")!
+        let html = try await fetchHTML(page)
+
+        var name = (slug.removingPercentEncoding ?? slug).replacingOccurrences(of: "-", with: " ")
+        if let h1 = matches("<h1[^>]*>.*?</a>\\s*([^<]+)</h1>", in: html).first {
+            let t = h1[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { name = t }
+        }
+
+        // Kits 섹션(베이스킷·노벨티·차일드킷)의 이미지만 대상. 없으면 렌더링 사진으로 폴백.
+        var body = html
+        if let kitsStart = html.range(of: "<h2 id=\"kits\">") {
+            let tail = String(html[kitsStart.upperBound...])
+            body = tail.range(of: "<h2 ").map { String(tail[..<$0.lowerBound]) } ?? tail
+        }
+        var kits: [Kit] = []
+        for m in matches("<img src=\"([^\"]+)\" alt=\"([^\"]*)\"", in: body) where m[1].contains("kits_pics") {
+            guard let url = URL(string: m[1].hasPrefix("http") ? m[1] : site + m[1]) else { continue }
+            let label = m[2].replacingOccurrences(of: "[-_]", with: " ", options: .regularExpression)
+                .capitalized
+            kits.append(Kit(name: label.isEmpty ? "Kit" : label, url: url))
+        }
+        // 전체 렌더 1~2장 추가 — 베이스킷 렌더가 빠진 페이지에서도 전체 모습은 보이게
+        let renders = matches("<img src=\"([^\"]+rendering_pics[^\"]+)\"", in: html).prefix(kits.isEmpty ? 4 : 2)
+        for (i, m) in renders.enumerated() {
+            guard let url = URL(string: m[1].hasPrefix("http") ? m[1] : site + m[1]) else { continue }
+            kits.append(Kit(name: "Render \(i + 1)", url: url))
+        }
+        return SetInfo(name: name, page: page, kits: kits)
+    }
+}
+
+// MARK: - GMK Panel
+
+private final class FlippedView: NSView { override var isFlipped: Bool { true } }
+
+final class GmkPanel: NSObject, NSWindowDelegate {
+    private var panel: NSPanel!
+    private var headerLabel: NSTextField!
+    private var spinner: NSProgressIndicator!
+    private var stack: NSStackView!
+    private var openButton: NSButton!
+    private var pageURL: URL?
+    private var searchTask: Task<Void, Never>?
+    private var ignoreResignUntil = Date.distantPast
+
+    static let shared = GmkPanel()
+
+    private func buildIfNeeded() {
+        guard panel == nil else { return }
+
+        let rect = NSRect(x: 0, y: 0, width: 540, height: 620)
+        panel = NSPanel(contentRect: rect,
+                        styleMask: [.titled, .closable, .resizable, .utilityWindow, .fullSizeContentView],
+                        backing: .buffered, defer: false)
+        panel.title = "GMK 검색"
+        panel.titlebarAppearsTransparent = true
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        panel.minSize = NSSize(width: 380, height: 300)
+
+        let blur = NSVisualEffectView(frame: rect)
+        blur.autoresizingMask = [.width, .height]
+        blur.material = .hudWindow
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        panel.contentView = blur
+
+        headerLabel = NSTextField(labelWithString: "")
+        headerLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        headerLabel.textColor = .secondaryLabelColor
+        headerLabel.translatesAutoresizingMaskIntoConstraints = false
+        blur.addSubview(headerLabel)
+
+        spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isDisplayedWhenStopped = false
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        blur.addSubview(spinner)
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = doc
+
+        stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(stack)
+
+        blur.addSubview(scroll)
+
+        openButton = NSButton(title: "GB 페이지 열기", target: self, action: #selector(openPage))
+        openButton.bezelStyle = .rounded
+        openButton.translatesAutoresizingMaskIntoConstraints = false
+        openButton.isHidden = true
+        blur.addSubview(openButton)
+
+        NSLayoutConstraint.activate([
+            headerLabel.topAnchor.constraint(equalTo: blur.topAnchor, constant: 30),
+            headerLabel.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: 14),
+
+            spinner.centerYAnchor.constraint(equalTo: headerLabel.centerYAnchor),
+            spinner.leadingAnchor.constraint(equalTo: headerLabel.trailingAnchor, constant: 8),
+
+            scroll.topAnchor.constraint(equalTo: headerLabel.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: 12),
+            scroll.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -12),
+            scroll.bottomAnchor.constraint(equalTo: openButton.topAnchor, constant: -8),
+
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            stack.topAnchor.constraint(equalTo: doc.topAnchor, constant: 4),
+            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor, constant: 4),
+            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor, constant: -4),
+            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor, constant: -4),
+
+            openButton.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -12),
+            openButton.bottomAnchor.constraint(equalTo: blur.bottomAnchor, constant: -12),
+        ])
+    }
+
+    @objc private func openPage() {
+        if let url = pageURL { NSWorkspace.shared.open(url) }
+    }
+
+    private func positionNearCursor() {
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main else { return }
+        let mouse = NSEvent.mouseLocation
+        var frame = panel.frame
+        frame.origin = NSPoint(x: mouse.x + 16, y: mouse.y - frame.height - 16)
+        let vis = screen.visibleFrame
+        frame.origin.x = min(max(frame.origin.x, vis.minX), vis.maxX - frame.width)
+        frame.origin.y = min(max(frame.origin.y, vis.minY), vis.maxY - frame.height)
+        panel.setFrame(frame, display: true)
+    }
+
+    private func clearStack() {
+        for v in stack.arrangedSubviews { stack.removeArrangedSubview(v); v.removeFromSuperview() }
+    }
+
+    private func showText(_ msg: String) {
+        clearStack()
+        let l = NSTextField(wrappingLabelWithString: msg)
+        l.font = .systemFont(ofSize: 13)
+        l.textColor = .labelColor
+        stack.addArrangedSubview(l)
+        l.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+
+    func show(query: String) {
+        DispatchQueue.main.async {
+            self.buildIfNeeded()
+            self.searchTask?.cancel()
+            self.headerLabel.stringValue = "GMK 검색  ·  \(query)"
+            self.pageURL = nil
+            self.openButton.isHidden = true
+            self.clearStack()
+            self.spinner.startAnimation(nil)
+            self.positionNearCursor()
+            self.panel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            self.ignoreResignUntil = Date().addingTimeInterval(0.5)
+            self.searchTask = Task { await self.run(query) }
+        }
+    }
+
+    @MainActor
+    private func run(_ query: String) async {
+        do {
+            let set = try await GMK.search(query)
+            guard !Task.isCancelled else { return }
+            headerLabel.stringValue = "GMK \(set.name)  ·  킷 \(set.kits.count)개"
+            pageURL = set.page
+            openButton.isHidden = false
+            if set.kits.isEmpty {
+                showText("세트는 찾았는데 킷 이미지가 없네요.\n‘GB 페이지 열기’ 로 원본 페이지를 확인하세요.")
+            } else {
+                clearStack()
+                for kit in set.kits { addKit(kit) }
+            }
+        } catch GMK.LookupError.notFound(let suggestions) {
+            if suggestions.isEmpty {
+                showText("‘\(query)’ 세트를 카탈로그에서 못 찾았어요.\n세트 이름(예: GMK Botanical)을 선택하고 다시 시도하세요.")
+            } else {
+                showText("‘\(query)’ 와 정확히 일치하는 세트가 없어요.\n비슷한 이름: \(suggestions.joined(separator: ", "))")
+            }
+        } catch {
+            if !Task.isCancelled {
+                showText("검색 실패: \(error.localizedDescription)\n네트워크 연결을 확인하세요.")
+            }
+        }
+        spinner.stopAnimation(nil)
+    }
+
+    private func addKit(_ kit: GMK.Kit) {
+        let label = NSTextField(labelWithString: kit.name)
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .labelColor
+        stack.addArrangedSubview(label)
+
+        let iv = NSImageView()
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        iv.wantsLayer = true
+        iv.layer?.cornerRadius = 6
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(iv)
+        iv.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        let placeholder = iv.heightAnchor.constraint(equalToConstant: 80)
+        placeholder.isActive = true
+
+        Task { @MainActor [weak iv] in
+            guard let (data, _) = try? await URLSession.shared.data(from: kit.url),
+                  let img = NSImage(data: data), img.size.width > 0, let iv = iv else { return }
+            iv.image = img
+            placeholder.isActive = false
+            iv.heightAnchor.constraint(equalTo: iv.widthAnchor,
+                                       multiplier: img.size.height / img.size.width).isActive = true
+        }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        searchTask?.cancel()
+        return true
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        guard Date() >= ignoreResignUntil else { return }
+        searchTask?.cancel()
+        panel.orderOut(nil)
     }
 }
 
@@ -314,10 +634,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private var tvTranslate: NSTextView!
     private var tvExplain: NSTextView!
     private var tvDetail: NSTextView!
+    private var tvSummarize: NSTextView!
     private var onSave: ((Config) -> Void)?
     private var current = Config()
 
-    private let W: CGFloat = 560, H: CGFloat = 620
+    private let W: CGFloat = 560, H: CGFloat = 730
 
     func show(config: Config, models: [String], onSave: @escaping (Config) -> Void) {
         self.onSave = onSave
@@ -334,6 +655,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         tvTranslate.string = config.prompts["translate"] ?? Config.defaultPrompts["translate"] ?? ""
         tvExplain.string   = config.prompts["explain"]   ?? Config.defaultPrompts["explain"]   ?? ""
         tvDetail.string    = config.prompts["detail"]    ?? Config.defaultPrompts["detail"]    ?? ""
+        tvSummarize.string = config.prompts["summarize"] ?? Config.defaultPrompts["summarize"] ?? ""
 
         NSApp.setActivationPolicy(.regular)   // so text fields get proper focus
         NSApp.activate(ignoringOtherApps: true)
@@ -393,6 +715,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         let (s1, t1) = editor(180, height: 80); tvTranslate = t1
         let (s2, t2) = editor(290, height: 80); tvExplain = t2
         let (s3, t3) = editor(400, height: 80); tvDetail = t3
+        let (s4, t4) = editor(510, height: 80); tvSummarize = t4
 
         c.addSubview(label("Ollama 주소", 32, size: 11))
         c.addSubview(hostField)
@@ -405,6 +728,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         c.addSubview(s2)
         c.addSubview(label("상세히", 382, size: 12, bold: true, h: 16))
         c.addSubview(s3)
+        c.addSubview(label("요약", 492, size: 12, bold: true, h: 16))
+        c.addSubview(s4)
 
         c.addSubview(button("기본값 복원", x: 16, w: 110, action: #selector(resetDefaults)))
         c.addSubview(button("저장", x: W - 16 - 90, w: 90, action: #selector(saveTapped), key: "\r"))
@@ -417,6 +742,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         tvTranslate.string = Config.defaultPrompts["translate"] ?? ""
         tvExplain.string   = Config.defaultPrompts["explain"] ?? ""
         tvDetail.string    = Config.defaultPrompts["detail"] ?? ""
+        tvSummarize.string = Config.defaultPrompts["summarize"] ?? ""
     }
 
     @objc private func cancelTapped() { window.close() }
@@ -429,6 +755,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         cfg.prompts["translate"] = tvTranslate.string
         cfg.prompts["explain"]   = tvExplain.string
         cfg.prompts["detail"]    = tvDetail.string
+        cfg.prompts["summarize"] = tvSummarize.string
         onSave?(cfg)
         window.close()
     }
@@ -452,7 +779,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let ctrl = UInt32(controlKey)
     private let opt  = UInt32(optionKey)
     // ANSI number key codes
-    private let key1: UInt32 = 18, key2: UInt32 = 19, key3: UInt32 = 20
+    private let key1: UInt32 = 18, key2: UInt32 = 19, key3: UInt32 = 20, key4: UInt32 = 21, key5: UInt32 = 23
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -474,6 +801,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("번역            ⌃⌥1", action: #selector(menuTranslate)))
         menu.addItem(item("쉽게 설명     ⌃⌥2", action: #selector(menuExplain)))
         menu.addItem(item("상세히         ⌃⌥3", action: #selector(menuDetail)))
+        menu.addItem(item("요약            ⌃⌥4", action: #selector(menuSummarize)))
+        menu.addItem(item("GMK 검색     ⌃⌥5", action: #selector(menuGmk)))
         menu.addItem(.separator())
 
         modelMenu = NSMenu()
@@ -564,18 +893,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func setupHotKeys() {
         hotKeys = HotKeys { [weak self] id in
             guard let self = self else { return }
-            let mode: Mode = id == 1 ? .translate : (id == 2 ? .explain : .detail)
-            self.triggerFromSelection(mode)
+            switch id {
+            case 1: self.triggerFromSelection(.translate)
+            case 2: self.triggerFromSelection(.explain)
+            case 3: self.triggerFromSelection(.detail)
+            case 4: self.triggerFromSelection(.summarize)
+            default: self.triggerGmkFromSelection()
+            }
         }
         hotKeys.register(id: 1, keyCode: key1, mods: ctrl | opt)
         hotKeys.register(id: 2, keyCode: key2, mods: ctrl | opt)
         hotKeys.register(id: 3, keyCode: key3, mods: ctrl | opt)
+        hotKeys.register(id: 4, keyCode: key4, mods: ctrl | opt)
+        hotKeys.register(id: 5, keyCode: key5, mods: ctrl | opt)
     }
 
     // Menu bar path: act on whatever is already on the clipboard.
     @objc private func menuTranslate() { runFromClipboard(.translate) }
     @objc private func menuExplain()   { runFromClipboard(.explain) }
     @objc private func menuDetail()    { runFromClipboard(.detail) }
+    @objc private func menuSummarize() { runFromClipboard(.summarize) }
+    @objc private func menuGmk() {
+        let text = NSPasteboard.general.string(forType: .string) ?? ""
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            ResultPanel.shared.showMessage("클립보드가 비어 있어요.\n세트 이름(예: GMK Botanical)을 선택하고 ⌘C 로 복사한 뒤 다시 시도하세요.")
+        } else {
+            GmkPanel.shared.show(query: Self.gmkQuery(from: text))
+        }
+    }
+
+    // 검색어는 첫 줄만, 과도하게 길면 자름 (본문 통째 복사 방지)
+    private static func gmkQuery(from text: String) -> String {
+        let firstLine = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .newlines).first ?? ""
+        return String(firstLine.prefix(60))
+    }
 
     private func runFromClipboard(_ mode: Mode) {
         let text = NSPasteboard.general.string(forType: .string) ?? ""
@@ -588,6 +940,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Hot-key path: auto-copy current selection (⌘C), then read clipboard.
     private func triggerFromSelection(_ mode: Mode) {
+        grabSelection { [weak self] text in
+            guard let self = self else { return }
+            ResultPanel.shared.start(mode: mode, text: text, config: self.config)
+        }
+    }
+
+    private func triggerGmkFromSelection() {
+        grabSelection { text in
+            GmkPanel.shared.show(query: Self.gmkQuery(from: text))
+        }
+    }
+
+    private func grabSelection(_ action: @escaping (String) -> Void) {
         if !AXIsProcessTrusted() {
             // trigger the system prompt + show guidance
             let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString: true] as CFDictionary
@@ -597,23 +962,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let before = NSPasteboard.general.changeCount
         simulateCmdC()
-        pollClipboard(since: before, attempts: 8, mode: mode)
+        pollClipboard(since: before, attempts: 8, action: action)
     }
 
     // Poll up to ~0.64s for ⌘C to land on the clipboard (apps vary in speed).
-    private func pollClipboard(since before: Int, attempts: Int, mode: Mode) {
+    private func pollClipboard(since before: Int, attempts: Int, action: @escaping (String) -> Void) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             guard let self = self else { return }
             let pb = NSPasteboard.general
             let text = pb.string(forType: .string) ?? ""
             let changed = pb.changeCount != before
             if changed && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                ResultPanel.shared.start(mode: mode, text: text, config: self.config)
+                action(text)
             } else if attempts > 1 {
-                self.pollClipboard(since: before, attempts: attempts - 1, mode: mode)
+                self.pollClipboard(since: before, attempts: attempts - 1, action: action)
             } else if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 // clipboard didn't change (no selection?), fall back to existing content
-                ResultPanel.shared.start(mode: mode, text: text, config: self.config)
+                action(text)
             } else {
                 ResultPanel.shared.showMessage("선택된 텍스트를 못 읽었어요.\n텍스트를 선택한 상태에서 단축키를 누르거나, ⌘C 로 복사 후 메뉴바 ✨ 에서 실행하세요.")
             }
