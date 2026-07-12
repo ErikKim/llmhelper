@@ -11,7 +11,7 @@ A tiny macOS menu-bar helper that runs your selected text through a **local [Oll
 - **Streaming floating panel** — appears near the cursor, types the answer in live, has a **Copy** button (and `⌘C`), and **auto-closes when it loses focus**.
 - **Model picker** — the ✨ menu lists your installed Ollama models (embedding models filtered out); pick one and it applies instantly.
 - **Settings window** — edit the Ollama host, model, and the four prompts (the `{text}` placeholder is replaced by your selection). Reset to defaults anytime.
-- **GMK keycap lookup** — select a set name (e.g. `GMK Botanical`) and hit `⌃⌥5` to see its base kit / novelties / child-kit renders in a floating panel, pulled from the community catalog at [matrixzj.github.io](https://matrixzj.github.io/docs/gmk-keycaps). No API key, no LLM involved.
+- **GMK keycap lookup** — select a set name (e.g. `GMK Botanical`) and hit `⌃⌥5` to see its base kit / novelties / child-kit renders in a floating panel, pulled from the community catalog at [matrixzj.github.io](https://matrixzj.github.io/docs/gmk-keycaps). Korean transliterations (e.g. `gmk 세리카`) and marketplace-listing noise (`-20`, kit lists in parens) are handled too — if direct matching fails, the local Ollama model resolves the name against the catalog list.
 
 ## Requirements
 

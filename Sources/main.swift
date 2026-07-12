@@ -138,6 +138,39 @@ enum GMK {
         return try await fetchSet(slug: hit.slug)
     }
 
+    // 직접 매칭 실패 시 폴백: 로컬 Ollama 에게 세트 목록을 주고 입력(한글 발음·오타 포함)이
+    // 가리키는 이름을 고르게 한다. 목록에 grounding 되므로 환각으로 없는 세트를 지어내지 못한다.
+    static func resolveViaLLM(query: String, config: Config) async throws -> String? {
+        let names = try await slugs().map {
+            ($0.removingPercentEncoding ?? $0).replacingOccurrences(of: "-", with: " ")
+        }
+        let prompt = """
+        아래는 GMK 키캡 세트 이름 목록이다.
+        \(names.joined(separator: ", "))
+
+        사용자 입력: "\(query)"
+        이 입력이 가리키는 세트 이름을 위 목록에서 딱 하나만 골라 그 이름만 출력해라. \
+        한글 발음 표기(예: 올리비아 → Olivia, 보태니컬 → Botanical)와 오타도 고려해라. \
+        해당하는 게 없으면 NONE 만 출력해라. 설명 금지.
+        """
+        guard let url = URL(string: config.host + "/api/generate") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": config.model, "prompt": prompt, "stream": false, "think": false,
+        ] as [String: Any])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var answer = obj["response"] as? String else { return nil }
+        answer = answer.replacingOccurrences(of: "<think>.*?</think>", with: "",
+                                             options: [.regularExpression])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if answer.isEmpty || answer.uppercased().contains("NONE") { return nil }
+        return answer
+    }
+
     static func fetchSet(slug: String) async throws -> SetInfo {
         let page = URL(string: site + "/docs/gmk-keycaps/" + slug + "/")!
         let html = try await fetchHTML(page)
@@ -299,7 +332,7 @@ final class GmkPanel: NSObject, NSWindowDelegate {
         l.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
     }
 
-    func show(query: String) {
+    func show(query: String, config: Config) {
         DispatchQueue.main.async {
             self.buildIfNeeded()
             self.searchTask?.cancel()
@@ -312,28 +345,27 @@ final class GmkPanel: NSObject, NSWindowDelegate {
             self.panel.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             self.ignoreResignUntil = Date().addingTimeInterval(0.5)
-            self.searchTask = Task { await self.run(query) }
+            self.searchTask = Task { await self.run(query, config: config) }
         }
     }
 
     @MainActor
-    private func run(_ query: String) async {
+    private func run(_ query: String, config: Config) async {
         do {
             let set = try await GMK.search(query)
             guard !Task.isCancelled else { return }
-            headerLabel.stringValue = "GMK \(set.name)  ·  킷 \(set.kits.count)개"
-            pageURL = set.page
-            openButton.isHidden = false
-            if set.kits.isEmpty {
-                showText("세트는 찾았는데 킷 이미지가 없네요.\n‘GB 페이지 열기’ 로 원본 페이지를 확인하세요.")
-            } else {
-                clearStack()
-                for kit in set.kits { addKit(kit) }
-            }
+            render(set)
         } catch GMK.LookupError.notFound(let suggestions) {
-            if suggestions.isEmpty {
+            // 직접 매칭 실패 → 로컬 LLM 으로 이름 해석 (한글 발음·오타)
+            headerLabel.stringValue = "GMK 검색  ·  ‘\(query)’ 이름 해석 중…  ·  \(config.model)"
+            if let resolved = try? await GMK.resolveViaLLM(query: query, config: config),
+               let set = try? await GMK.search(resolved), !Task.isCancelled {
+                render(set)
+            } else if suggestions.isEmpty {
+                headerLabel.stringValue = "GMK 검색  ·  \(query)"
                 showText("‘\(query)’ 세트를 카탈로그에서 못 찾았어요.\n세트 이름(예: GMK Botanical)을 선택하고 다시 시도하세요.")
             } else {
+                headerLabel.stringValue = "GMK 검색  ·  \(query)"
                 showText("‘\(query)’ 와 정확히 일치하는 세트가 없어요.\n비슷한 이름: \(suggestions.joined(separator: ", "))")
             }
         } catch {
@@ -342,6 +374,19 @@ final class GmkPanel: NSObject, NSWindowDelegate {
             }
         }
         spinner.stopAnimation(nil)
+    }
+
+    @MainActor
+    private func render(_ set: GMK.SetInfo) {
+        headerLabel.stringValue = "GMK \(set.name)  ·  킷 \(set.kits.count)개"
+        pageURL = set.page
+        openButton.isHidden = false
+        if set.kits.isEmpty {
+            showText("세트는 찾았는데 킷 이미지가 없네요.\n‘GB 페이지 열기’ 로 원본 페이지를 확인하세요.")
+        } else {
+            clearStack()
+            for kit in set.kits { addKit(kit) }
+        }
     }
 
     private func addKit(_ kit: GMK.Kit) {
@@ -355,6 +400,11 @@ final class GmkPanel: NSObject, NSWindowDelegate {
         iv.wantsLayer = true
         iv.layer?.cornerRadius = 6
         iv.translatesAutoresizingMaskIntoConstraints = false
+        // 원본 픽셀 크기(intrinsic size) 주장을 무력화 — 크기는 아래 제약(패널 폭 + 종횡비)만 결정
+        iv.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        iv.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .vertical)
+        iv.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        iv.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .vertical)
         stack.addArrangedSubview(iv)
         iv.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         let placeholder = iv.heightAnchor.constraint(equalToConstant: 80)
@@ -365,8 +415,10 @@ final class GmkPanel: NSObject, NSWindowDelegate {
                   let img = NSImage(data: data), img.size.width > 0, let iv = iv else { return }
             iv.image = img
             placeholder.isActive = false
-            iv.heightAnchor.constraint(equalTo: iv.widthAnchor,
-                                       multiplier: img.size.height / img.size.width).isActive = true
+            let aspect = iv.heightAnchor.constraint(equalTo: iv.widthAnchor,
+                                                    multiplier: img.size.height / img.size.width)
+            aspect.priority = NSLayoutConstraint.Priority(999)   // 리사이즈 중 반올림 충돌 방지
+            aspect.isActive = true
         }
     }
 
@@ -918,15 +970,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             ResultPanel.shared.showMessage("클립보드가 비어 있어요.\n세트 이름(예: GMK Botanical)을 선택하고 ⌘C 로 복사한 뒤 다시 시도하세요.")
         } else {
-            GmkPanel.shared.show(query: Self.gmkQuery(from: text))
+            GmkPanel.shared.show(query: Self.gmkQuery(from: text), config: config)
         }
     }
 
-    // 검색어는 첫 줄만, 과도하게 길면 자름 (본문 통째 복사 방지)
+    // 검색어 전처리: 첫 줄만, 중고글 꼬리표 제거.
+    // "gmk 믹틀란리버스(base+centinela) -33" → "gmk 믹틀란리버스"
+    // "gmk 세리카 영각 - 12" → "gmk 세리카 영각",  "gmk 디지털나이트메어 -ㅍㅇ" → "gmk 디지털나이트메어"
     private static func gmkQuery(from text: String) -> String {
-        let firstLine = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var q = text.trimmingCharacters(in: .whitespacesAndNewlines)
             .components(separatedBy: .newlines).first ?? ""
-        return String(firstLine.prefix(60))
+        if let i = q.firstIndex(where: { "(（+".contains($0) }) { q = String(q[..<i]) }
+        q = q.replacingOccurrences(of: "\\s*-\\s*(?:[0-9]+|[ㄱ-ㅎㅏ-ㅣ]+)\\s*$",
+                                   with: "", options: .regularExpression)
+        return String(q.trimmingCharacters(in: .whitespaces).prefix(60))
     }
 
     private func runFromClipboard(_ mode: Mode) {
@@ -947,8 +1004,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func triggerGmkFromSelection() {
-        grabSelection { text in
-            GmkPanel.shared.show(query: Self.gmkQuery(from: text))
+        grabSelection { [weak self] text in
+            guard let self = self else { return }
+            GmkPanel.shared.show(query: Self.gmkQuery(from: text), config: self.config)
         }
     }
 
